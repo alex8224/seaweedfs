@@ -4,8 +4,8 @@ import "github.com/chrislusf/seaweedfs/weed/pb/master_pb"
 
 func (t *Topology) ToMap() interface{} {
 	m := make(map[string]interface{})
-	m["Max"] = t.GetMaxVolumeCount()
-	m["Free"] = t.FreeSpace()
+	m["Max"] = t.diskUsages.GetMaxVolumeCount()
+	m["Free"] = t.diskUsages.FreeSpace()
 	var dcs []interface{}
 	for _, c := range t.Children() {
 		dc := c.(*DataCenter)
@@ -23,14 +23,14 @@ func (t *Topology) ToMap() interface{} {
 			}
 		}
 	}
-	m["layouts"] = layouts
+	m["Layouts"] = layouts
 	return m
 }
 
 func (t *Topology) ToVolumeMap() interface{} {
 	m := make(map[string]interface{})
-	m["Max"] = t.GetMaxVolumeCount()
-	m["Free"] = t.FreeSpace()
+	m["Max"] = t.diskUsages.GetMaxVolumeCount()
+	m["Free"] = t.diskUsages.FreeSpace()
 	dcs := make(map[NodeId]interface{})
 	for _, c := range t.Children() {
 		dc := c.(*DataCenter)
@@ -68,9 +68,24 @@ func (t *Topology) ToVolumeLocations() (volumeLocations []*master_pb.VolumeLocat
 				for _, v := range dn.GetVolumes() {
 					volumeLocation.NewVids = append(volumeLocation.NewVids, uint32(v.Id))
 				}
+				for _, s := range dn.GetEcShards() {
+					volumeLocation.NewVids = append(volumeLocation.NewVids, uint32(s.VolumeId))
+				}
 				volumeLocations = append(volumeLocations, volumeLocation)
 			}
 		}
 	}
 	return
+}
+
+func (t *Topology) ToTopologyInfo() *master_pb.TopologyInfo {
+	m := &master_pb.TopologyInfo{
+		Id:        string(t.Id()),
+		DiskInfos: t.diskUsages.ToDiskInfo(),
+	}
+	for _, c := range t.Children() {
+		dc := c.(*DataCenter)
+		m.DataCenterInfos = append(m.DataCenterInfos, dc.ToDataCenterInfo())
+	}
+	return m
 }

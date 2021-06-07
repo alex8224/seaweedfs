@@ -1,8 +1,8 @@
 package command
 
 import (
-	"flag"
 	"fmt"
+	flag "github.com/chrislusf/seaweedfs/weed/util/fla9"
 	"os"
 	"strings"
 )
@@ -12,21 +12,30 @@ var Commands = []*Command{
 	cmdBackup,
 	cmdCompact,
 	cmdCopy,
-	cmdFix,
-	cmdFilerExport,
-	cmdFilerReplicate,
-	cmdServer,
-	cmdMaster,
-	cmdFiler,
-	cmdS3,
-	cmdUpload,
 	cmdDownload,
+	cmdExport,
+	cmdFiler,
+	cmdFilerBackup,
+	cmdFilerCat,
+	cmdFilerMetaBackup,
+	cmdFilerMetaTail,
+	cmdFilerReplicate,
+	cmdFilerSynchronize,
+	cmdFix,
+	cmdFuse,
+	cmdGateway,
+	cmdMaster,
+	cmdMount,
+	cmdS3,
+	cmdIam,
+	cmdMsgBroker,
 	cmdScaffold,
+	cmdServer,
 	cmdShell,
+	cmdUpload,
 	cmdVersion,
 	cmdVolume,
-	cmdExport,
-	cmdMount,
+	cmdWebDav,
 }
 
 type Command struct {

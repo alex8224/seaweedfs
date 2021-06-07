@@ -2,13 +2,14 @@ package S3Sink
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/chrislusf/seaweedfs/weed/filer2"
+	"github.com/chrislusf/seaweedfs/weed/filer"
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/util"
@@ -23,7 +24,7 @@ func (s3sink *S3Sink) deleteObject(key string) error {
 	result, err := s3sink.conn.DeleteObject(input)
 
 	if err == nil {
-		glog.V(0).Infof("[%s] delete %s: %v", s3sink.bucket, key, result)
+		glog.V(2).Infof("[%s] delete %s: %v", s3sink.bucket, key, result)
 	} else {
 		glog.Errorf("[%s] delete %s: %v", s3sink.bucket, key, err)
 	}
@@ -42,7 +43,7 @@ func (s3sink *S3Sink) createMultipartUpload(key string, entry *filer_pb.Entry) (
 	result, err := s3sink.conn.CreateMultipartUpload(input)
 
 	if err == nil {
-		glog.V(0).Infof("[%s] createMultipartUpload %s: %v", s3sink.bucket, key, result)
+		glog.V(2).Infof("[%s] createMultipartUpload %s: %v", s3sink.bucket, key, result)
 	} else {
 		glog.Errorf("[%s] createMultipartUpload %s: %v", s3sink.bucket, key, err)
 		return "", err
@@ -81,7 +82,7 @@ func (s3sink *S3Sink) abortMultipartUpload(key, uploadId string) error {
 }
 
 // To complete multipart upload
-func (s3sink *S3Sink) completeMultipartUpload(key, uploadId string, parts []*s3.CompletedPart) error {
+func (s3sink *S3Sink) completeMultipartUpload(ctx context.Context, key, uploadId string, parts []*s3.CompletedPart) error {
 	input := &s3.CompleteMultipartUploadInput{
 		Bucket:   aws.String(s3sink.bucket),
 		Key:      aws.String(key),
@@ -93,16 +94,17 @@ func (s3sink *S3Sink) completeMultipartUpload(key, uploadId string, parts []*s3.
 
 	result, err := s3sink.conn.CompleteMultipartUpload(input)
 	if err == nil {
-		glog.V(0).Infof("[%s] completeMultipartUpload %s: %v", s3sink.bucket, key, result)
+		glog.V(2).Infof("[%s] completeMultipartUpload %s: %v", s3sink.bucket, key, result)
 	} else {
 		glog.Errorf("[%s] completeMultipartUpload %s: %v", s3sink.bucket, key, err)
+		return fmt.Errorf("[%s] completeMultipartUpload %s: %v", s3sink.bucket, key, err)
 	}
 
-	return err
+	return nil
 }
 
 // To upload a part
-func (s3sink *S3Sink) uploadPart(key, uploadId string, partId int, chunk *filer2.ChunkView) (*s3.CompletedPart, error) {
+func (s3sink *S3Sink) uploadPart(key, uploadId string, partId int, chunk *filer.ChunkView) (*s3.CompletedPart, error) {
 	var readSeeker io.ReadSeeker
 
 	readSeeker, err := s3sink.buildReadSeeker(chunk)
@@ -121,7 +123,7 @@ func (s3sink *S3Sink) uploadPart(key, uploadId string, partId int, chunk *filer2
 
 	result, err := s3sink.conn.UploadPart(input)
 	if err == nil {
-		glog.V(0).Infof("[%s] uploadPart %s %d upload: %v", s3sink.bucket, key, partId, result)
+		glog.V(2).Infof("[%s] uploadPart %s %d upload: %v", s3sink.bucket, key, partId, result)
 	} else {
 		glog.Errorf("[%s] uploadPart %s %d upload: %v", s3sink.bucket, key, partId, err)
 	}
@@ -155,12 +157,19 @@ func (s3sink *S3Sink) uploadPartCopy(key, uploadId string, partId int64, copySou
 	return err
 }
 
-func (s3sink *S3Sink) buildReadSeeker(chunk *filer2.ChunkView) (io.ReadSeeker, error) {
-	fileUrl, err := s3sink.filerSource.LookupFileId(chunk.FileId)
+func (s3sink *S3Sink) buildReadSeeker(chunk *filer.ChunkView) (io.ReadSeeker, error) {
+	fileUrls, err := s3sink.filerSource.LookupFileId(chunk.FileId)
 	if err != nil {
 		return nil, err
 	}
 	buf := make([]byte, chunk.Size)
-	util.ReadUrl(fileUrl, chunk.Offset, int(chunk.Size), buf)
+	for _, fileUrl := range fileUrls {
+		_, err = util.ReadUrl(fileUrl, chunk.CipherKey, chunk.IsGzipped, false, chunk.Offset, int(chunk.Size), buf)
+		if err != nil {
+			glog.V(1).Infof("read from %s: %v", fileUrl, err)
+		} else {
+			break
+		}
+	}
 	return bytes.NewReader(buf), nil
 }

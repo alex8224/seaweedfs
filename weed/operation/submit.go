@@ -1,7 +1,6 @@
 package operation
 
 import (
-	"bytes"
 	"io"
 	"mime"
 	"net/url"
@@ -9,6 +8,8 @@ import (
 	"path"
 	"strconv"
 	"strings"
+
+	"google.golang.org/grpc"
 
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/security"
@@ -18,29 +19,29 @@ type FilePart struct {
 	Reader      io.Reader
 	FileName    string
 	FileSize    int64
-	IsGzipped   bool
 	MimeType    string
 	ModTime     int64 //in seconds
 	Replication string
 	Collection  string
 	DataCenter  string
 	Ttl         string
+	DiskType    string
 	Server      string //this comes from assign result
 	Fid         string //this comes from assign result, but customizable
+	Fsync       bool
 }
 
 type SubmitResult struct {
 	FileName string `json:"fileName,omitempty"`
-	FileUrl  string `json:"fileUrl,omitempty"`
+	FileUrl  string `json:"url,omitempty"`
 	Fid      string `json:"fid,omitempty"`
 	Size     uint32 `json:"size,omitempty"`
 	Error    string `json:"error,omitempty"`
 }
 
-func SubmitFiles(master string, files []FilePart,
-	replication string, collection string, dataCenter string, ttl string, maxMB int,
-	secret security.Secret,
-) ([]SubmitResult, error) {
+type GetMasterFn func() string
+
+func SubmitFiles(masterFn GetMasterFn, grpcDialOption grpc.DialOption, files []FilePart, replication string, collection string, dataCenter string, ttl string, diskType string, maxMB int, usePublicUrl bool) ([]SubmitResult, error) {
 	results := make([]SubmitResult, len(files))
 	for index, file := range files {
 		results[index].FileName = file.FileName
@@ -51,10 +52,11 @@ func SubmitFiles(master string, files []FilePart,
 		Collection:  collection,
 		DataCenter:  dataCenter,
 		Ttl:         ttl,
+		DiskType:    diskType,
 	}
-	ret, err := Assign(master, ar)
+	ret, err := Assign(masterFn, grpcDialOption, ar)
 	if err != nil {
-		for index, _ := range files {
+		for index := range files {
 			results[index].Error = err.Error()
 		}
 		return results, err
@@ -65,10 +67,15 @@ func SubmitFiles(master string, files []FilePart,
 			file.Fid = file.Fid + "_" + strconv.Itoa(index)
 		}
 		file.Server = ret.Url
+		if usePublicUrl {
+			file.Server = ret.PublicUrl
+		}
 		file.Replication = replication
 		file.Collection = collection
 		file.DataCenter = dataCenter
-		results[index].Size, err = file.Upload(maxMB, master, secret)
+		file.Ttl = ttl
+		file.DiskType = diskType
+		results[index].Size, err = file.Upload(maxMB, masterFn, usePublicUrl, ret.Auth, grpcDialOption)
 		if err != nil {
 			results[index].Error = err.Error()
 		}
@@ -103,7 +110,6 @@ func newFilePart(fullPathFilename string) (ret FilePart, err error) {
 	ret.ModTime = fi.ModTime().UTC().Unix()
 	ret.FileSize = fi.Size()
 	ext := strings.ToLower(path.Ext(fullPathFilename))
-	ret.IsGzipped = ext == ".gz"
 	ret.FileName = fi.Name()
 	if ext != "" {
 		ret.MimeType = mime.TypeByExtension(ext)
@@ -112,11 +118,13 @@ func newFilePart(fullPathFilename string) (ret FilePart, err error) {
 	return ret, nil
 }
 
-func (fi FilePart) Upload(maxMB int, master string, secret security.Secret) (retSize uint32, err error) {
-	jwt := security.GenJwt(secret, fi.Fid)
+func (fi FilePart) Upload(maxMB int, masterFn GetMasterFn, usePublicUrl bool, jwt security.EncodedJwt, grpcDialOption grpc.DialOption) (retSize uint32, err error) {
 	fileUrl := "http://" + fi.Server + "/" + fi.Fid
 	if fi.ModTime != 0 {
 		fileUrl += "?ts=" + strconv.Itoa(int(fi.ModTime))
+	}
+	if fi.Fsync {
+		fileUrl += "?fsync=true"
 	}
 	if closer, ok := fi.Reader.(io.Closer); ok {
 		defer closer.Close()
@@ -140,8 +148,9 @@ func (fi FilePart) Upload(maxMB int, master string, secret security.Secret) (ret
 				Replication: fi.Replication,
 				Collection:  fi.Collection,
 				Ttl:         fi.Ttl,
+				DiskType:    fi.DiskType,
 			}
-			ret, err = Assign(master, ar)
+			ret, err = Assign(masterFn, grpcDialOption, ar)
 			if err != nil {
 				return
 			}
@@ -153,11 +162,12 @@ func (fi FilePart) Upload(maxMB int, master string, secret security.Secret) (ret
 					Replication: fi.Replication,
 					Collection:  fi.Collection,
 					Ttl:         fi.Ttl,
+					DiskType:    fi.DiskType,
 				}
-				ret, err = Assign(master, ar)
+				ret, err = Assign(masterFn, grpcDialOption, ar)
 				if err != nil {
 					// delete all uploaded chunks
-					cm.DeleteChunks(master)
+					cm.DeleteChunks(masterFn, usePublicUrl, grpcDialOption)
 					return
 				}
 				id = ret.Fid
@@ -168,14 +178,17 @@ func (fi FilePart) Upload(maxMB int, master string, secret security.Secret) (ret
 				}
 			}
 			fileUrl := "http://" + ret.Url + "/" + id
+			if usePublicUrl {
+				fileUrl = "http://" + ret.PublicUrl + "/" + id
+			}
 			count, e := upload_one_chunk(
 				baseName+"-"+strconv.FormatInt(i+1, 10),
 				io.LimitReader(fi.Reader, chunkSize),
-				master, fileUrl,
-				jwt)
+				masterFn, fileUrl,
+				ret.Auth)
 			if e != nil {
 				// delete all uploaded chunks
-				cm.DeleteChunks(master)
+				cm.DeleteChunks(masterFn, usePublicUrl, grpcDialOption)
 				return 0, e
 			}
 			cm.Chunks = append(cm.Chunks,
@@ -190,10 +203,10 @@ func (fi FilePart) Upload(maxMB int, master string, secret security.Secret) (ret
 		err = upload_chunked_file_manifest(fileUrl, &cm, jwt)
 		if err != nil {
 			// delete all uploaded chunks
-			cm.DeleteChunks(master)
+			cm.DeleteChunks(masterFn, usePublicUrl, grpcDialOption)
 		}
 	} else {
-		ret, e := Upload(fileUrl, baseName, fi.Reader, fi.IsGzipped, fi.MimeType, nil, jwt)
+		ret, e, _ := Upload(fileUrl, baseName, false, fi.Reader, false, fi.MimeType, nil, jwt)
 		if e != nil {
 			return 0, e
 		}
@@ -202,12 +215,11 @@ func (fi FilePart) Upload(maxMB int, master string, secret security.Secret) (ret
 	return
 }
 
-func upload_one_chunk(filename string, reader io.Reader, master,
+func upload_one_chunk(filename string, reader io.Reader, masterFn GetMasterFn,
 	fileUrl string, jwt security.EncodedJwt,
 ) (size uint32, e error) {
 	glog.V(4).Info("Uploading part ", filename, " to ", fileUrl, "...")
-	uploadResult, uploadError := Upload(fileUrl, filename, reader, false,
-		"application/octet-stream", nil, jwt)
+	uploadResult, uploadError, _ := Upload(fileUrl, filename, false, reader, false, "", nil, jwt)
 	if uploadError != nil {
 		return 0, uploadError
 	}
@@ -219,12 +231,11 @@ func upload_chunked_file_manifest(fileUrl string, manifest *ChunkManifest, jwt s
 	if e != nil {
 		return e
 	}
-	bufReader := bytes.NewReader(buf)
 	glog.V(4).Info("Uploading chunks manifest ", manifest.Name, " to ", fileUrl, "...")
 	u, _ := url.Parse(fileUrl)
 	q := u.Query()
 	q.Set("cm", "true")
 	u.RawQuery = q.Encode()
-	_, e = Upload(u.String(), manifest.Name, bufReader, false, "application/json", nil, jwt)
+	_, e = UploadData(u.String(), manifest.Name, false, buf, false, "application/json", nil, jwt)
 	return e
 }

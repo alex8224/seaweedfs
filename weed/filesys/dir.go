@@ -1,173 +1,266 @@
 package filesys
 
 import (
+	"bytes"
 	"context"
+	"math"
 	"os"
-	"path"
-	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
-	"github.com/chrislusf/seaweedfs/weed/filer2"
+	"github.com/seaweedfs/fuse"
+	"github.com/seaweedfs/fuse/fs"
+
+	"github.com/chrislusf/seaweedfs/weed/filer"
+	"github.com/chrislusf/seaweedfs/weed/filesys/meta_cache"
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
+	"github.com/chrislusf/seaweedfs/weed/util"
 )
 
 type Dir struct {
-	Path       string
-	wfs        *WFS
-	attributes *filer_pb.FuseAttributes
+	name   string
+	wfs    *WFS
+	entry  *filer_pb.Entry
+	parent *Dir
+	id     uint64
 }
 
 var _ = fs.Node(&Dir{})
+
+var _ = fs.NodeIdentifier(&Dir{})
 var _ = fs.NodeCreater(&Dir{})
+var _ = fs.NodeMknoder(&Dir{})
 var _ = fs.NodeMkdirer(&Dir{})
+var _ = fs.NodeFsyncer(&Dir{})
 var _ = fs.NodeRequestLookuper(&Dir{})
 var _ = fs.HandleReadDirAller(&Dir{})
 var _ = fs.NodeRemover(&Dir{})
 var _ = fs.NodeRenamer(&Dir{})
 var _ = fs.NodeSetattrer(&Dir{})
+var _ = fs.NodeGetxattrer(&Dir{})
+var _ = fs.NodeSetxattrer(&Dir{})
+var _ = fs.NodeRemovexattrer(&Dir{})
+var _ = fs.NodeListxattrer(&Dir{})
+var _ = fs.NodeForgetter(&Dir{})
 
-func (dir *Dir) Attr(context context.Context, attr *fuse.Attr) error {
-
-	if dir.Path == "/" {
-		attr.Valid = time.Second
-		attr.Mode = os.ModeDir | 0777
-		return nil
+func (dir *Dir) Id() uint64 {
+	if dir.parent == nil {
+		return 1
 	}
+	return dir.id
+}
 
-	item := dir.wfs.listDirectoryEntriesCache.Get(dir.Path)
-	if item != nil && !item.Expired() {
-		entry := item.Value().(*filer_pb.Entry)
+func (dir *Dir) Attr(ctx context.Context, attr *fuse.Attr) error {
 
-		attr.Mtime = time.Unix(entry.Attributes.Mtime, 0)
-		attr.Ctime = time.Unix(entry.Attributes.Crtime, 0)
-		attr.Mode = os.FileMode(entry.Attributes.FileMode)
-		attr.Gid = entry.Attributes.Gid
-		attr.Uid = entry.Attributes.Uid
-
-		return nil
-	}
-
-	parent, name := filepath.Split(dir.Path)
-
-	err := dir.wfs.withFilerClient(func(client filer_pb.SeaweedFilerClient) error {
-
-		request := &filer_pb.LookupDirectoryEntryRequest{
-			Directory: parent,
-			Name:      name,
-		}
-
-		glog.V(1).Infof("read dir %s attr: %v", dir.Path, request)
-		resp, err := client.LookupDirectoryEntry(context, request)
-		if err != nil {
-			glog.V(0).Infof("read dir %s attr %v: %v", dir.Path, request, err)
-			return err
-		}
-
-		if resp.Entry != nil {
-			dir.attributes = resp.Entry.Attributes
-		}
-
-		return nil
-	})
-
+	entry, err := dir.maybeLoadEntry()
 	if err != nil {
+		glog.V(3).Infof("dir Attr %s, err: %+v", dir.FullPath(), err)
 		return err
 	}
 
-	// glog.V(1).Infof("dir %s: %v", dir.Path, attributes)
-	// glog.V(1).Infof("dir %s permission: %v", dir.Path, os.FileMode(attributes.FileMode))
+	// https://github.com/bazil/fuse/issues/196
+	attr.Valid = time.Second
+	attr.Inode = dir.Id()
+	attr.Mode = os.FileMode(entry.Attributes.FileMode) | os.ModeDir
+	attr.Mtime = time.Unix(entry.Attributes.Mtime, 0)
+	attr.Crtime = time.Unix(entry.Attributes.Crtime, 0)
+	attr.Ctime = time.Unix(entry.Attributes.Crtime, 0)
+	attr.Atime = time.Unix(entry.Attributes.Mtime, 0)
+	attr.Gid = entry.Attributes.Gid
+	attr.Uid = entry.Attributes.Uid
 
-	attr.Mode = os.FileMode(dir.attributes.FileMode) | os.ModeDir
-	if dir.Path == "/" && dir.attributes.FileMode == 0 {
-		attr.Valid = time.Second
+	if dir.FullPath() == dir.wfs.option.FilerMountRootPath {
+		attr.BlockSize = blockSize
 	}
 
-	attr.Mtime = time.Unix(dir.attributes.Mtime, 0)
-	attr.Ctime = time.Unix(dir.attributes.Crtime, 0)
-	attr.Gid = dir.attributes.Gid
-	attr.Uid = dir.attributes.Uid
+	glog.V(4).Infof("dir Attr %s, attr: %+v", dir.FullPath(), attr)
 
 	return nil
 }
 
-func (dir *Dir) newFile(name string, entry *filer_pb.Entry) *File {
-	return &File{
-		Name:  name,
-		dir:   dir,
-		wfs:   dir.wfs,
-		entry: entry,
+func (dir *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+
+	glog.V(4).Infof("dir Getxattr %s", dir.FullPath())
+
+	entry, err := dir.maybeLoadEntry()
+	if err != nil {
+		return err
 	}
+
+	return getxattr(entry, req, resp)
+}
+
+func (dir *Dir) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+	// fsync works at OS level
+	// write the file chunks to the filerGrpcAddress
+	glog.V(3).Infof("dir %s fsync %+v", dir.FullPath(), req)
+
+	return nil
+}
+
+func (dir *Dir) newFile(name string) fs.Node {
+
+	fileFullPath := util.NewFullPath(dir.FullPath(), name)
+	fileId := fileFullPath.AsInode()
+	dir.wfs.handlesLock.Lock()
+	existingHandle, found := dir.wfs.handles[fileId]
+	dir.wfs.handlesLock.Unlock()
+
+	if found {
+		glog.V(4).Infof("newFile found opened file handle: %+v", fileFullPath)
+		return existingHandle.f
+	}
+	return &File{
+		Name: name,
+		dir:  dir,
+		wfs:  dir.wfs,
+		id:   fileId,
+	}
+}
+
+func (dir *Dir) newDirectory(fullpath util.FullPath) fs.Node {
+
+	return &Dir{name: fullpath.Name(), wfs: dir.wfs, parent: dir, id: fullpath.AsInode()}
+
 }
 
 func (dir *Dir) Create(ctx context.Context, req *fuse.CreateRequest,
 	resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 
+	exclusive := req.Flags&fuse.OpenExclusive != 0
+	isDirectory := req.Mode&os.ModeDir > 0
+
+	if exclusive || isDirectory {
+		_, err := dir.doCreateEntry(req.Name, req.Mode, req.Uid, req.Gid, exclusive)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	var node fs.Node
+	if isDirectory {
+		node = dir.newDirectory(util.NewFullPath(dir.FullPath(), req.Name))
+		return node, nil, nil
+	}
+
+	node = dir.newFile(req.Name)
+	file := node.(*File)
+	file.entry = &filer_pb.Entry{
+		Name:        req.Name,
+		IsDirectory: req.Mode&os.ModeDir > 0,
+		Attributes: &filer_pb.FuseAttributes{
+			Mtime:       time.Now().Unix(),
+			Crtime:      time.Now().Unix(),
+			FileMode:    uint32(req.Mode &^ dir.wfs.option.Umask),
+			Uid:         req.Uid,
+			Gid:         req.Gid,
+			Collection:  dir.wfs.option.Collection,
+			Replication: dir.wfs.option.Replication,
+			TtlSec:      dir.wfs.option.TtlSec,
+		},
+	}
+	file.dirtyMetadata = true
+	fh := dir.wfs.AcquireHandle(file, req.Uid, req.Gid, req.Flags&fuse.OpenWriteOnly > 0)
+	return file, fh, nil
+
+}
+
+func (dir *Dir) Mknod(ctx context.Context, req *fuse.MknodRequest) (fs.Node, error) {
+
+	_, err := dir.doCreateEntry(req.Name, req.Mode, req.Uid, req.Gid, false)
+
+	if err != nil {
+		return nil, err
+	}
+	var node fs.Node
+	node = dir.newFile(req.Name)
+	return node, nil
+}
+
+func (dir *Dir) doCreateEntry(name string, mode os.FileMode, uid, gid uint32, exclusive bool) (*filer_pb.CreateEntryRequest, error) {
+	dirFullPath := dir.FullPath()
 	request := &filer_pb.CreateEntryRequest{
-		Directory: dir.Path,
+		Directory: dirFullPath,
 		Entry: &filer_pb.Entry{
-			Name:        req.Name,
-			IsDirectory: req.Mode&os.ModeDir > 0,
+			Name:        name,
+			IsDirectory: mode&os.ModeDir > 0,
 			Attributes: &filer_pb.FuseAttributes{
 				Mtime:       time.Now().Unix(),
 				Crtime:      time.Now().Unix(),
-				FileMode:    uint32(req.Mode),
-				Uid:         req.Uid,
-				Gid:         req.Gid,
+				FileMode:    uint32(mode &^ dir.wfs.option.Umask),
+				Uid:         uid,
+				Gid:         gid,
 				Collection:  dir.wfs.option.Collection,
 				Replication: dir.wfs.option.Replication,
 				TtlSec:      dir.wfs.option.TtlSec,
 			},
 		},
+		OExcl:      exclusive,
+		Signatures: []int32{dir.wfs.signature},
 	}
-	glog.V(1).Infof("create: %v", request)
+	glog.V(1).Infof("create %s/%s", dirFullPath, name)
 
-	if request.Entry.IsDirectory {
-		if err := dir.wfs.withFilerClient(func(client filer_pb.SeaweedFilerClient) error {
-			if _, err := client.CreateEntry(ctx, request); err != nil {
-				glog.V(0).Infof("create %s/%s: %v", dir.Path, req.Name, err)
-				return fuse.EIO
+	err := dir.wfs.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+
+		dir.wfs.mapPbIdFromLocalToFiler(request.Entry)
+		defer dir.wfs.mapPbIdFromFilerToLocal(request.Entry)
+
+		if err := filer_pb.CreateEntry(client, request); err != nil {
+			if strings.Contains(err.Error(), "EEXIST") {
+				return fuse.EEXIST
 			}
-			return nil
-		}); err != nil {
-			return nil, nil, err
+			glog.V(0).Infof("create %s/%s: %v", dirFullPath, name, err)
+			return fuse.EIO
 		}
-	}
 
-	file := dir.newFile(req.Name, request.Entry)
-	if !request.Entry.IsDirectory {
-		file.isOpen = true
-	}
-	fh := dir.wfs.AcquireHandle(file, req.Uid, req.Gid)
-	fh.dirtyMetadata = true
-	return file, fh, nil
+		if err := dir.wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry(request.Directory, request.Entry)); err != nil {
+			glog.Errorf("local InsertEntry dir %s/%s: %v", dirFullPath, name, err)
+			return fuse.EIO
+		}
 
+		return nil
+	})
+	return request, err
 }
 
 func (dir *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
 
-	err := dir.wfs.withFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	glog.V(4).Infof("mkdir %s: %s", dir.FullPath(), req.Name)
+
+	newEntry := &filer_pb.Entry{
+		Name:        req.Name,
+		IsDirectory: true,
+		Attributes: &filer_pb.FuseAttributes{
+			Mtime:    time.Now().Unix(),
+			Crtime:   time.Now().Unix(),
+			FileMode: uint32(req.Mode &^ dir.wfs.option.Umask),
+			Uid:      req.Uid,
+			Gid:      req.Gid,
+		},
+	}
+
+	dirFullPath := dir.FullPath()
+
+	err := dir.wfs.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+
+		dir.wfs.mapPbIdFromLocalToFiler(newEntry)
+		defer dir.wfs.mapPbIdFromFilerToLocal(newEntry)
 
 		request := &filer_pb.CreateEntryRequest{
-			Directory: dir.Path,
-			Entry: &filer_pb.Entry{
-				Name:        req.Name,
-				IsDirectory: true,
-				Attributes: &filer_pb.FuseAttributes{
-					Mtime:    time.Now().Unix(),
-					Crtime:   time.Now().Unix(),
-					FileMode: uint32(req.Mode),
-					Uid:      req.Uid,
-					Gid:      req.Gid,
-				},
-			},
+			Directory:  dirFullPath,
+			Entry:      newEntry,
+			Signatures: []int32{dir.wfs.signature},
 		}
 
 		glog.V(1).Infof("mkdir: %v", request)
-		if _, err := client.CreateEntry(ctx, request); err != nil {
-			glog.V(0).Infof("mkdir %s/%s: %v", dir.Path, req.Name, err)
+		if err := filer_pb.CreateEntry(client, request); err != nil {
+			glog.V(0).Infof("mkdir %s/%s: %v", dirFullPath, req.Name, err)
+			return err
+		}
+
+		if err := dir.wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry(request.Directory, request.Entry)); err != nil {
+			glog.Errorf("local mkdir dir %s/%s: %v", dirFullPath, req.Name, err)
 			return fuse.EIO
 		}
 
@@ -175,149 +268,348 @@ func (dir *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, err
 	})
 
 	if err == nil {
-		node := &Dir{Path: path.Join(dir.Path, req.Name), wfs: dir.wfs}
+		node := dir.newDirectory(util.NewFullPath(dirFullPath, req.Name))
+
 		return node, nil
 	}
 
-	return nil, err
+	glog.V(0).Infof("mkdir %s/%s: %v", dirFullPath, req.Name, err)
+
+	return nil, fuse.EIO
 }
 
 func (dir *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (node fs.Node, err error) {
 
-	var entry *filer_pb.Entry
-	err = dir.wfs.withFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	dirPath := util.FullPath(dir.FullPath())
+	// glog.V(4).Infof("dir Lookup %s: %s by %s", dirPath, req.Name, req.Header.String())
 
-		request := &filer_pb.LookupDirectoryEntryRequest{
-			Directory: dir.Path,
-			Name:      req.Name,
-		}
+	fullFilePath := dirPath.Child(req.Name)
+	visitErr := meta_cache.EnsureVisited(dir.wfs.metaCache, dir.wfs, dirPath)
+	if visitErr != nil {
+		glog.Errorf("dir Lookup %s: %v", dirPath, visitErr)
+		return nil, fuse.EIO
+	}
+	localEntry, cacheErr := dir.wfs.metaCache.FindEntry(context.Background(), fullFilePath)
+	if cacheErr == filer_pb.ErrNotFound {
+		return nil, fuse.ENOENT
+	}
 
-		glog.V(4).Infof("lookup directory entry: %v", request)
-		resp, err := client.LookupDirectoryEntry(ctx, request)
+	if localEntry == nil {
+		// glog.V(3).Infof("dir Lookup cache miss %s", fullFilePath)
+		entry, err := filer_pb.GetEntry(dir.wfs, fullFilePath)
 		if err != nil {
-			// glog.V(0).Infof("lookup %s/%s: %v", dir.Path, name, err)
-			return fuse.ENOENT
+			glog.V(1).Infof("dir GetEntry %s: %v", fullFilePath, err)
+			return nil, fuse.ENOENT
 		}
+		localEntry = filer.FromPbEntry(string(dirPath), entry)
+	} else {
+		glog.V(4).Infof("dir Lookup cache hit %s", fullFilePath)
+	}
 
-		entry = resp.Entry
-
-		return nil
-	})
-
-	if entry != nil {
-		if entry.IsDirectory {
-			node = &Dir{Path: path.Join(dir.Path, req.Name), wfs: dir.wfs, attributes: entry.Attributes}
+	if localEntry != nil {
+		if localEntry.IsDirectory() {
+			node = dir.newDirectory(fullFilePath)
 		} else {
-			node = dir.newFile(req.Name, entry)
+			node = dir.newFile(req.Name)
 		}
 
-		resp.EntryValid = time.Duration(0)
-		resp.Attr.Mtime = time.Unix(entry.Attributes.Mtime, 0)
-		resp.Attr.Ctime = time.Unix(entry.Attributes.Crtime, 0)
-		resp.Attr.Mode = os.FileMode(entry.Attributes.FileMode)
-		resp.Attr.Gid = entry.Attributes.Gid
-		resp.Attr.Uid = entry.Attributes.Uid
+		// resp.EntryValid = time.Second
+		resp.Attr.Inode = fullFilePath.AsInode()
+		resp.Attr.Valid = time.Second
+		resp.Attr.Size = localEntry.FileSize
+		resp.Attr.Mtime = localEntry.Attr.Mtime
+		resp.Attr.Crtime = localEntry.Attr.Crtime
+		resp.Attr.Mode = localEntry.Attr.Mode
+		resp.Attr.Gid = localEntry.Attr.Gid
+		resp.Attr.Uid = localEntry.Attr.Uid
+		if localEntry.HardLinkCounter > 0 {
+			resp.Attr.Nlink = uint32(localEntry.HardLinkCounter)
+		}
 
 		return node, nil
 	}
 
+	glog.V(4).Infof("not found dir GetEntry %s: %v", fullFilePath, err)
 	return nil, fuse.ENOENT
 }
 
 func (dir *Dir) ReadDirAll(ctx context.Context) (ret []fuse.Dirent, err error) {
 
-	err = dir.wfs.withFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	dirPath := util.FullPath(dir.FullPath())
+	glog.V(4).Infof("dir ReadDirAll %s", dirPath)
 
-		request := &filer_pb.ListEntriesRequest{
-			Directory: dir.Path,
-			Limit:     uint32(dir.wfs.option.DirListingLimit),
+	processEachEntryFn := func(entry *filer.Entry, isLast bool) {
+		if entry.IsDirectory() {
+			dirent := fuse.Dirent{Name: entry.Name(), Type: fuse.DT_Dir, Inode: dirPath.Child(entry.Name()).AsInode()}
+			ret = append(ret, dirent)
+		} else {
+			dirent := fuse.Dirent{Name: entry.Name(), Type: findFileType(uint16(entry.Attr.Mode)), Inode: dirPath.Child(entry.Name()).AsInode()}
+			ret = append(ret, dirent)
 		}
+	}
 
-		glog.V(4).Infof("read directory: %v", request)
-		resp, err := client.ListEntries(ctx, request)
-		if err != nil {
-			glog.V(0).Infof("list %s: %v", dir.Path, err)
-			return fuse.EIO
-		}
+	if err = meta_cache.EnsureVisited(dir.wfs.metaCache, dir.wfs, dirPath); err != nil {
+		glog.Errorf("dir ReadDirAll %s: %v", dirPath, err)
+		return nil, fuse.EIO
+	}
+	listErr := dir.wfs.metaCache.ListDirectoryEntries(context.Background(), dirPath, "", false, int64(math.MaxInt32), func(entry *filer.Entry) bool {
+		processEachEntryFn(entry, false)
+		return true
+	})
+	if listErr != nil {
+		glog.Errorf("list meta cache: %v", listErr)
+		return nil, fuse.EIO
+	}
 
-		for _, entry := range resp.Entries {
-			if entry.IsDirectory {
-				dirent := fuse.Dirent{Name: entry.Name, Type: fuse.DT_Dir}
-				ret = append(ret, dirent)
-			} else {
-				dirent := fuse.Dirent{Name: entry.Name, Type: fuse.DT_File}
-				ret = append(ret, dirent)
-			}
-			dir.wfs.listDirectoryEntriesCache.Set(dir.Path+"/"+entry.Name, entry, 300*time.Millisecond)
-		}
-
-		return nil
+	// create proper . and .. directories
+	ret = append(ret, fuse.Dirent{
+		Inode: dirPath.AsInode(),
+		Name:  ".",
+		Type:  fuse.DT_Dir,
 	})
 
-	return ret, err
+	// return the correct parent inode for the mount root
+	var inode uint64
+	if string(dirPath) == dir.wfs.option.FilerMountRootPath {
+		inode = dir.wfs.option.MountParentInode
+	} else {
+		inode = util.FullPath(dir.parent.FullPath()).AsInode()
+	}
+
+	ret = append(ret, fuse.Dirent{
+		Inode: inode,
+		Name:  "..",
+		Type:  fuse.DT_Dir,
+	})
+
+	return
+}
+
+func findFileType(mode uint16) fuse.DirentType {
+	switch mode & (syscall.S_IFMT & 0xffff) {
+	case syscall.S_IFSOCK:
+		return fuse.DT_Socket
+	case syscall.S_IFLNK:
+		return fuse.DT_Link
+	case syscall.S_IFREG:
+		return fuse.DT_File
+	case syscall.S_IFBLK:
+		return fuse.DT_Block
+	case syscall.S_IFDIR:
+		return fuse.DT_Dir
+	case syscall.S_IFCHR:
+		return fuse.DT_Char
+	case syscall.S_IFIFO:
+		return fuse.DT_FIFO
+	}
+	return fuse.DT_File
 }
 
 func (dir *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 
-	return dir.wfs.withFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	if !req.Dir {
+		return dir.removeOneFile(req)
+	}
 
-		request := &filer_pb.DeleteEntryRequest{
-			Directory:    dir.Path,
-			Name:         req.Name,
-			IsDirectory:  req.Dir,
-			IsDeleteData: true,
+	return dir.removeFolder(req)
+
+}
+
+func (dir *Dir) removeOneFile(req *fuse.RemoveRequest) error {
+
+	dirFullPath := dir.FullPath()
+	filePath := util.NewFullPath(dirFullPath, req.Name)
+	entry, err := filer_pb.GetEntry(dir.wfs, filePath)
+	if err != nil {
+		return err
+	}
+
+	// first, ensure the filer store can correctly delete
+	glog.V(3).Infof("remove file: %v", req)
+	isDeleteData := entry != nil && entry.HardLinkCounter <= 1
+	err = filer_pb.Remove(dir.wfs, dirFullPath, req.Name, isDeleteData, false, false, false, []int32{dir.wfs.signature})
+	if err != nil {
+		glog.V(3).Infof("not found remove file %s: %v", filePath, err)
+		return fuse.ENOENT
+	}
+
+	// then, delete meta cache and fsNode cache
+	if err = dir.wfs.metaCache.DeleteEntry(context.Background(), filePath); err != nil {
+		glog.V(3).Infof("local DeleteEntry %s: %v", filePath, err)
+		return fuse.ESTALE
+	}
+
+	// remove current file handle if any
+	dir.wfs.handlesLock.Lock()
+	defer dir.wfs.handlesLock.Unlock()
+	inodeId := filePath.AsInode()
+	delete(dir.wfs.handles, inodeId)
+
+	return nil
+
+}
+
+func (dir *Dir) removeFolder(req *fuse.RemoveRequest) error {
+
+	dirFullPath := dir.FullPath()
+	glog.V(3).Infof("remove directory entry: %v", req)
+	ignoreRecursiveErr := true // ignore recursion error since the OS should manage it
+	err := filer_pb.Remove(dir.wfs, dirFullPath, req.Name, true, true, ignoreRecursiveErr, false, []int32{dir.wfs.signature})
+	if err != nil {
+		glog.V(0).Infof("remove %s/%s: %v", dirFullPath, req.Name, err)
+		if strings.Contains(err.Error(), "non-empty") {
+			return fuse.EEXIST
 		}
+		return fuse.ENOENT
+	}
 
-		glog.V(1).Infof("remove directory entry: %v", request)
-		_, err := client.DeleteEntry(ctx, request)
-		if err != nil {
-			glog.V(0).Infof("remove %s/%s: %v", dir.Path, req.Name, err)
-			return fuse.EIO
-		}
+	t := util.NewFullPath(dirFullPath, req.Name)
+	dir.wfs.metaCache.DeleteEntry(context.Background(), t)
 
-		return nil
-	})
+	return nil
 
 }
 
 func (dir *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
 
-	glog.V(3).Infof("%v dir setattr %+v, fh=%d", dir.Path, req, req.Handle)
+	glog.V(4).Infof("%v dir setattr %+v", dir.FullPath(), req)
+
+	entry, err := dir.maybeLoadEntry()
+	if err != nil {
+		return err
+	}
+
 	if req.Valid.Mode() {
-		dir.attributes.FileMode = uint32(req.Mode)
+		entry.Attributes.FileMode = uint32(req.Mode)
 	}
 
 	if req.Valid.Uid() {
-		dir.attributes.Uid = req.Uid
+		entry.Attributes.Uid = req.Uid
 	}
 
 	if req.Valid.Gid() {
-		dir.attributes.Gid = req.Gid
+		entry.Attributes.Gid = req.Gid
 	}
 
 	if req.Valid.Mtime() {
-		dir.attributes.Mtime = req.Mtime.Unix()
+		entry.Attributes.Mtime = req.Mtime.Unix()
 	}
 
-	parentDir, name := filer2.FullPath(dir.Path).DirAndName()
-	return dir.wfs.withFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	return dir.saveEntry(entry)
+
+}
+
+func (dir *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
+
+	glog.V(4).Infof("dir Setxattr %s: %s", dir.FullPath(), req.Name)
+
+	entry, err := dir.maybeLoadEntry()
+	if err != nil {
+		return err
+	}
+
+	if err := setxattr(entry, req); err != nil {
+		return err
+	}
+
+	return dir.saveEntry(entry)
+
+}
+
+func (dir *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) error {
+
+	glog.V(4).Infof("dir Removexattr %s: %s", dir.FullPath(), req.Name)
+
+	entry, err := dir.maybeLoadEntry()
+	if err != nil {
+		return err
+	}
+
+	if err := removexattr(entry, req); err != nil {
+		return err
+	}
+
+	return dir.saveEntry(entry)
+
+}
+
+func (dir *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
+
+	glog.V(4).Infof("dir Listxattr %s", dir.FullPath())
+
+	entry, err := dir.maybeLoadEntry()
+	if err != nil {
+		return err
+	}
+
+	if err := listxattr(entry, req, resp); err != nil {
+		return err
+	}
+
+	return nil
+
+}
+
+func (dir *Dir) Forget() {
+	glog.V(4).Infof("Forget dir %s", dir.FullPath())
+}
+
+func (dir *Dir) maybeLoadEntry() (*filer_pb.Entry, error) {
+	parentDirPath, name := util.FullPath(dir.FullPath()).DirAndName()
+	return dir.wfs.maybeLoadEntry(parentDirPath, name)
+}
+
+func (dir *Dir) saveEntry(entry *filer_pb.Entry) error {
+
+	parentDir, name := util.FullPath(dir.FullPath()).DirAndName()
+
+	return dir.wfs.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+
+		dir.wfs.mapPbIdFromLocalToFiler(entry)
+		defer dir.wfs.mapPbIdFromFilerToLocal(entry)
 
 		request := &filer_pb.UpdateEntryRequest{
-			Directory: parentDir,
-			Entry: &filer_pb.Entry{
-				Name:       name,
-				Attributes: dir.attributes,
-			},
+			Directory:  parentDir,
+			Entry:      entry,
+			Signatures: []int32{dir.wfs.signature},
 		}
 
-		glog.V(1).Infof("set attr directory entry: %v", request)
-		_, err := client.UpdateEntry(ctx, request)
+		glog.V(1).Infof("save dir entry: %v", request)
+		_, err := client.UpdateEntry(context.Background(), request)
 		if err != nil {
-			glog.V(0).Infof("UpdateEntry %s: %v", dir.Path, err)
+			glog.Errorf("UpdateEntry dir %s/%s: %v", parentDir, name, err)
 			return fuse.EIO
+		}
+
+		if err := dir.wfs.metaCache.UpdateEntry(context.Background(), filer.FromPbEntry(request.Directory, request.Entry)); err != nil {
+			glog.Errorf("UpdateEntry dir %s/%s: %v", parentDir, name, err)
+			return fuse.ESTALE
 		}
 
 		return nil
 	})
+}
 
+func (dir *Dir) FullPath() string {
+	var parts []string
+	for p := dir; p != nil; p = p.parent {
+		if strings.HasPrefix(p.name, "/") {
+			if len(p.name) > 1 {
+				parts = append(parts, p.name[1:])
+			}
+		} else {
+			parts = append(parts, p.name)
+		}
+	}
+
+	if len(parts) == 0 {
+		return "/"
+	}
+
+	var buf bytes.Buffer
+	for i := len(parts) - 1; i >= 0; i-- {
+		buf.WriteString("/")
+		buf.WriteString(parts[i])
+	}
+	return buf.String()
 }
